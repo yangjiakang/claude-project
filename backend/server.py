@@ -221,6 +221,9 @@ async def scrape_video(req: ScrapeRequest):
         """在后台线程中执行爬取任务"""
         global _current_task  # 声明使用全局变量
         try:
+            # —— 清理残留的 .m3u8 文件，避免重复处理旧数据 ——
+            _cleanup_stale_m3u8(OUTPUT_DIR)  # 删除上次可能遗留的 m3u8 播放列表
+
             # 推送批量风格事件（单 URL 包装为 batch=1，与批量模式统一格式）
             _push_progress(json.dumps({
                 "type": "batch_start",
@@ -464,6 +467,15 @@ async def scrape_video(req: ScrapeRequest):
                 if file_path.suffix.lower() in (".mp4", ".webm", ".mkv", ".mov", ".avi", ".flv"):
                     try:
                         size_mb = file_path.stat().st_size / (1024 * 1024)  # 计算文件大小 MB
+                        # 跳过过小的文件（< 500KB，通常是 GIF 预览或错误页面）
+                        if size_mb < 0.5:
+                            _push_progress(json.dumps({
+                                "type": "log",
+                                "url_index": 0,
+                                "message": f"⚠️ 跳过过小文件: {file_path.name} ({size_mb:.2f} MB)",
+                            }, ensure_ascii=False))
+                            file_path.unlink(missing_ok=True)  # 删除无效文件
+                            continue
                         duration = _get_video_duration(str(file_path))  # 获取视频时长
                         _add_history_entry(  # 写入历史记录
                             url=req.url,
@@ -568,6 +580,9 @@ async def scrape_video_batch(req: BatchScrapeRequest):
     def _run_batch_scrape():
         """后台逐 URL 处理批量爬取"""
         global _current_task
+
+        # —— 清理残留的 .m3u8 文件，避免重复处理旧数据 ——
+        _cleanup_stale_m3u8(OUTPUT_DIR)  # 删除上次可能遗留的 m3u8 播放列表
 
         # 推送批量任务开始
         _push_progress(json.dumps({
@@ -970,6 +985,29 @@ async def list_files():
 
 
 # ——— 工具函数 ———
+
+def _cleanup_stale_m3u8(directory: Path) -> int:
+    """清理输出目录中残留的 .m3u8 文件
+
+    在每次爬取开始前调用，避免旧下载残留的 m3u8 文件
+    导致重复处理同一视频流。
+
+    Args:
+        directory: 输出目录路径
+
+    Returns:
+        删除的文件数量
+    """
+    count = 0  # 已删除计数
+    if directory.exists():
+        for m3u8_file in directory.glob("*.m3u8"):  # 遍历所有 m3u8 文件
+            try:
+                m3u8_file.unlink()  # 删除文件
+                count += 1
+            except OSError:
+                pass  # 无法删除则跳过（如权限问题）
+    return count
+
 
 def _extract_page_title(html: str) -> str:
     """从 HTML 中提取网页标题（<title> 标签内容）

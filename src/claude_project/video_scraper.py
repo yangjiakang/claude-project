@@ -261,6 +261,24 @@ class VideoScraper:
             result["skipped"] += len(all_video_infos) - len(filtered)  # 统计被过滤掉的数量
             all_video_infos = filtered
 
+        # —— 优先级排序：HLS/m3u8 > 真实视频 > GIF预览/其他 ——
+        def _video_priority(info: VideoInfo) -> int:
+            """计算视频优先级分数（数字越小越优先）"""
+            url = info.url
+            # 第一优先级：HLS/m3u8 流媒体
+            if info.is_hls or _is_m3u8_url(url):
+                return 0  # 第一优先
+            # 第二优先级：直接视频链接（.mp4/.webm/.mkv 等）
+            if any(url.lower().endswith(ext) for ext in (".mp4", ".webm", ".mkv", ".mov", ".flv", ".avi")):
+                return 10  # 第二优先
+            # 第三优先级：通用视频 URL（通过 Content-Type 判断的）
+            if self._looks_like_video_url(url):
+                return 20  # 第三优先
+            # 最低优先级：其他
+            return 30  # 最低优先
+
+        all_video_infos.sort(key=_video_priority)  # 按优先级升序排列，HLS 优先下载
+
         # —— 第四步：限制下载数量 ——
         if self.config.max_videos > 0:
             all_video_infos = all_video_infos[:self.config.max_videos]  # 截取前 N 个
@@ -269,7 +287,7 @@ class VideoScraper:
         print(f"找到 {total} 个视频，开始下载...\n")  # 告知用户开始下载
 
         # —— 第五步：对 HLS 流媒体给出 ffmpeg 下载提示 ——
-        hls_infos = [v for v in all_video_infos if v.is_hls or v.url.endswith(".m3u8")]
+        hls_infos = [v for v in all_video_infos if v.is_hls or _is_m3u8_url(v.url)]
         # 筛选出所有 HLS/m3u8 视频
         result["hls_found"] = len(hls_infos)  # 记录 HLS 数量到统计结果
         result["m3u8_urls"] = [info.url for info in hls_infos]  # 保存 m3u8 URL 列表，供后端直接使用（省去重新爬页面的时间）
@@ -450,13 +468,20 @@ class VideoScraper:
                         infos.append(VideoInfo(url=src, title=title, source_type="source_tag",
                                               is_hls=src.endswith(".m3u8")))
 
-            # 1c: <video> 的 data-src 懒加载属性
-            for attr in ("data-src", "data-video-url", "data-url"):  # 常见的懒加载属性名
+            # 1c: <video> 的 data-* 懒加载属性（包括 data-mp4 / data-webm）
+            for attr in ("data-src", "data-video-url", "data-url", "data-mp4", "data-webm"):
                 val = (video_tag.get(attr) or "").strip()  # 获取属性值
                 if val:
+                    # 跳过 GIF 预览链接（如 pornhub /pics/gifs/*.mp4，只是缩略图动图）
+                    if "/pics/gifs/" in val:
+                        continue  # 这些是预览片段，不是真实视频
                     if val.startswith("blob:"):
                         self._warn_blob_url(val, f"video_{attr}")  # blob URL 警告
                     elif not val.startswith("data:"):
+                        # 跳过被标记为 gifVideo 的预览元素
+                        video_classes = " ".join(video_tag.get("class", []) if isinstance(video_tag.get("class"), list) else [video_tag.get("class", "")]).lower()
+                        if "gifvideo" in video_classes:
+                            continue  # 这些是 GIF 预览，不是真实视频
                         title = self._extract_video_title(video_tag)
                         infos.append(VideoInfo(url=val, title=title, source_type=f"video_{attr}",
                                               is_hls=val.endswith(".m3u8")))
@@ -540,18 +565,22 @@ class VideoScraper:
             r'"(?:contentUrl|content_url)\s*"\s*:\s*"(https?://[^"]+(?:\.mp4|\.webm)[^"]*)"',
             r'"play_url"\s*:\s*"(https?://[^"]+)"',  # 抖音等平台的 play_url
             r'"(?:url|src|video)"\s*:\s*"(https?://[^"]+?\.m3u8[^"]*)"',  # 内嵌的 m3u8 URL
+            # Pornhub mediaDefinitions 格式（JSON 中反斜杠转义的 URL：https:\/\/...）
+            r'"videoUrl"\s*:\s*"(https?:\\?/\\?/[^"]+\.m3u8[^"]*)"',
         ]
         for pattern in js_patterns:  # 遍历每个正则表达式模式
             matches = re.findall(pattern, html, re.IGNORECASE)  # 在 HTML 中搜索匹配项
             for match in matches:
                 url = match if isinstance(match, str) else match[0]  # 提取 URL 部分
+                # 修复 JSON 转义的斜杠（Pornhub 等网站的 mediaDefinitions 格式）
+                url = url.replace(r"\/", "/")  # 将 \/ 还原为 /
                 if url.startswith("blob:"):
                     self._warn_blob_url(url, "js_variable")  # blob URL 警告
                     continue
                 if self._looks_like_video_url(url) or ".mp4" in url or ".m3u8" in url:
-                    # 判断是否为视频 URL
+                    # 判断是否为视频 URL（处理查询参数导致 .endswith('.m3u8') 失败的情况）
                     infos.append(VideoInfo(url=url, title="", source_type="js_variable",
-                                          is_hls=url.endswith(".m3u8")))
+                                          is_hls=_is_m3u8_url(url)))
 
         # ——— 策略 7：播放器 data-* 配置检测（DPlayer / Plyr / Video.js / JW Player） ———
         player_infos = self._extract_player_configs(soup, html)

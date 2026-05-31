@@ -8,3 +8,11 @@ dist/
 .gstack/
 图纸图片/
 .DS_Store
+videos/
+.claude/
+*.m3u8
+*.mp4
+*.webm
+*.mkv
+*.mov
+backend/history.json

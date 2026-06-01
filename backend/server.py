@@ -282,22 +282,24 @@ async def scrape_video(req: ScrapeRequest):
                 }, ensure_ascii=False))
 
                 # —— 获取 m3u8 URL 和网页标题 ——
-                # 优先从爬取结果中获取 m3u8 URL（省去重复请求页面的时间）
+                # 优先从爬取结果中获取（省去重复请求页面的时间）
                 saved_m3u8_urls: list[str] = result.get("m3u8_urls", [])  # 爬取器已发现的 m3u8 URL
                 m3u8_url = saved_m3u8_urls[0] if saved_m3u8_urls else ""  # 取第一个
-                page_title = ""  # 网页标题，用于文件命名
+                page_title = result.get("page_title", "")  # 从爬取结果获取页面标题
+                if page_title:
+                    _push_progress(json.dumps({
+                        "type": "log",
+                        "url_index": 0,
+                        "message": f"📄 网页标题: {page_title}",
+                    }, ensure_ascii=False))
 
                 if m3u8_url:
-                    # 已有 m3u8 URL，只需获取页面标题（尝试轻量方式）
                     _push_progress(json.dumps({
                         "type": "log",
                         "url_index": 0,
                         "message": "📡 使用已发现的视频源...",
                     }, ensure_ascii=False))
-                    # 从 m3u8 文件同目录查找可能的页面标题（从之前 print 拦截的日志中获取）
-                    # 如果 m3u8 内容中包含标题信息，提取之
                 else:
-                    # 回退：重新获取页面提取 m3u8 URL 和标题
                     _push_progress(json.dumps({
                         "type": "log",
                         "url_index": 0,
@@ -644,6 +646,13 @@ async def scrape_video_batch(req: BatchScrapeRequest):
                 m3u8_files = list(OUTPUT_DIR.glob("*.m3u8"))
                 # 从爬取结果获取已发现的 m3u8 URL（省去重复请求页面）
                 saved_m3u8_urls: list[str] = result.get("m3u8_urls", [])
+                result_page_title: str = result.get("page_title", "")  # 爬取器已提取的页面标题
+                if result_page_title:
+                    _push_progress(json.dumps({
+                        "type": "log",
+                        "url_index": url_idx,
+                        "message": f"📄 网页标题: {result_page_title}",
+                    }, ensure_ascii=False))
                 # 从 m3u8 播放列表解析总时长（省去 ffprobe 网络请求）
                 m3u8_duration = 0.0
 
@@ -668,7 +677,7 @@ async def scrape_video_batch(req: BatchScrapeRequest):
 
                     # 提取 m3u8 URL 和页面标题
                     import requests as req_lib, re as regex, subprocess as sp
-                    page_title = ""
+                    page_title = result_page_title  # 优先使用爬取器已提取的标题
                     try:
                         if not m3u8_url:
                             # 没有已保存的 URL，需要重新获取页面

@@ -291,6 +291,7 @@ class VideoScraper:
         # 筛选出所有 HLS/m3u8 视频
         result["hls_found"] = len(hls_infos)  # 记录 HLS 数量到统计结果
         result["m3u8_urls"] = [info.url for info in hls_infos]  # 保存 m3u8 URL 列表，供后端直接使用（省去重新爬页面的时间）
+        result["page_title"] = self._page_title  # 传递页面标题给后端，避免二次拉取页面获取标题
         if hls_infos:
             print("\n" + "=" * 60)  # 分隔线
             print("⚠️  检测到 HLS/m3u8 流媒体视频，浏览器无法直接下载。")  # 提示用户

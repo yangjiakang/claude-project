@@ -18,3 +18,9 @@ videos/
 backend/history.json
 node_modules/
 frontend/node_modules/
+
+# macOS App 构建产物
+macos-app/.build/
+macos-app/*.app/
+macos-app/*.dmg
+.vscode/

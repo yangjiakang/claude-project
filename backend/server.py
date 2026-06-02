@@ -448,11 +448,87 @@ async def scrape_video(req: ScrapeRequest):
                         m3u8_file.unlink(missing_ok=True)
                         real_video_files.append(output_path)
                     else:
-                        _push_progress(json.dumps({
-                            "type": "log",
-                            "url_index": 0,
-                            "message": f"❌ ffmpeg 下载失败 (exit={process.returncode})",
-                        }, ensure_ascii=False))
+                        # 🔄 Token 过期重试：重新获取页面提取新 m3u8 URL
+                        stderr_output = ""
+                        try:
+                            process.stderr.seek(0)
+                            stderr_output = process.stderr.read() or ""
+                        except Exception:
+                            pass
+                        # 检测 410/403 错误（Pornhub CDN Token 过期）
+                        if "410" in stderr_output or "403" in stderr_output or process.returncode != 0:
+                            _push_progress(json.dumps({
+                                "type": "log", "url_index": 0,
+                                "message": "🔄 Token 可能过期，重新获取视频源...",
+                            }, ensure_ascii=False))
+                            output_path.unlink(missing_ok=True)  # 删除不完整的文件
+                            try:
+                                import requests as req_lib2
+                                page2 = req_lib2.get(req.url, headers={
+                                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+                                }, timeout=config.timeout)
+                                page2.raise_for_status()
+                                fresh_html = page2.text
+                                # 提取新的 m3u8 URL
+                                config_m = regex.search(r"data-config='([^']+)'", fresh_html)
+                                fresh_m3u8 = ""
+                                if config_m:
+                                    import html as html_mod2
+                                    cj = html_mod2.unescape(config_m.group(1))
+                                    try:
+                                        cd = json.loads(cj)
+                                        fresh_m3u8 = (cd.get("video", {}).get("url2") or
+                                                     cd.get("video", {}).get("url") or "")
+                                    except json.JSONDecodeError:
+                                        pass
+                                if not fresh_m3u8:
+                                    mm = regex.findall(r'https?://[^"\'<>]+\.m3u8[^"\'<>]*', fresh_html)
+                                    if mm: fresh_m3u8 = mm[0]
+                                # 用新 Token 重试
+                                if fresh_m3u8:
+                                    _push_progress(json.dumps({
+                                        "type": "log", "url_index": 0,
+                                        "message": "🔁 使用新 Token 重试下载...",
+                                    }, ensure_ascii=False))
+                                    retry_cmd = [
+                                        "ffmpeg", "-user_agent",
+                                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                                        "-i", fresh_m3u8, "-c", "copy", "-bsf:a", "aac_adtstoasc",
+                                        "-progress", "pipe:1", "-nostats", "-loglevel", "error",
+                                        "-y", str(output_path),
+                                    ]
+                                    retry_process = sp.Popen(retry_cmd, stdout=sp.PIPE, stderr=sp.PIPE,
+                                                           text=True, encoding="utf-8", errors="replace")
+                                    retry_process.wait(timeout=7200)
+                                    if retry_process.returncode == 0 and output_path.exists():
+                                        size_mb = output_path.stat().st_size / (1024 * 1024)
+                                        _push_progress(json.dumps({
+                                            "type": "ffmpeg_progress", "url_index": 0,
+                                            "percent": 100,
+                                            "message": f"✅ 重试成功: {output_path.name} ({size_mb:.1f} MB)",
+                                        }, ensure_ascii=False))
+                                        m3u8_file.unlink(missing_ok=True)
+                                        real_video_files.append(output_path)
+                                    else:
+                                        _push_progress(json.dumps({
+                                            "type": "log", "url_index": 0,
+                                            "message": f"❌ 重试仍失败 (exit={retry_process.returncode})",
+                                        }, ensure_ascii=False))
+                                else:
+                                    _push_progress(json.dumps({
+                                        "type": "log", "url_index": 0,
+                                        "message": "❌ 重试失败：未找到新的视频源",
+                                    }, ensure_ascii=False))
+                            except Exception as retry_err:
+                                _push_progress(json.dumps({
+                                    "type": "log", "url_index": 0,
+                                    "message": f"❌ 重试异常: {retry_err}",
+                                }, ensure_ascii=False))
+                        else:
+                            _push_progress(json.dumps({
+                                "type": "log", "url_index": 0,
+                                "message": f"❌ ffmpeg 下载失败 (exit={process.returncode})",
+                            }, ensure_ascii=False))
                 else:
                     _push_progress(json.dumps({
                         "type": "log",

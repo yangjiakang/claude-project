@@ -2,259 +2,208 @@ import Foundation
 import AppKit
 import OSLog
 
-/// 全局下载状态管理器
-/// 管理下载队列、进度更新、历史记录、通知触发、速度显示
+/// 下载队列管理器 — 单任务串行 + 本地队列（最多 15 个）
+/// SSE 事件始终对应 tasks[0]（当前活跃任务）
 @MainActor
 final class DownloadStore: ObservableObject {
-    @Published var tasks: [DownloadTask] = []          // 当前下载队列
-    @Published var completedTasks: [DownloadTask] = [] // 已完成/历史记录
-    @Published var isDownloading = false               // 是否有任务在下载
-    @Published var totalProgress: Double = 0           // 总进度 0-100
-    @Published var statusMessage = "就绪"               // 状态栏消息
-    @Published var downloadSpeed = ""                  // 当前下载速度 "4.2 MB/s"
-
-    /// 用户设置（持久化到 UserDefaults）
+    @Published var tasks: [DownloadTask] = []
+    @Published var completedTasks: [DownloadTask] = []
+    @Published var isDownloading = false
+    @Published var totalProgress: Double = 0
+    @Published var statusMessage = "就绪"
+    @Published var downloadSpeed = ""
     @Published var settings = AppSettings.load()
 
     private let api: APIClient
     private let logger = Logger(subsystem: "com.downieclip.app", category: "Store")
-    private var activeTaskIndex: Int?
-    private var lastFileSize: Double = 0               // 上次文件大小（计算速度）
-    private var lastProgressTime: Date = Date()
+    private let maxQueue = 15
+    private let thumbnailGen = ThumbnailGenerator()
 
-    /// 外部注入的通知管理器（Phase 2）
     var notificationManager: NotificationManager?
-
-    /// 下载完成回调（供 MainApp 注入通知逻辑）
-    var onDownloadComplete: ((String, String, String) -> Void)?
 
     init(api: APIClient) { self.api = api }
 
-    // MARK: - 速度计算
+    // MARK: - 添加任务
 
-    /// 根据文件大小变化计算下载速度
-    func updateSpeed(currentSizeMB: Double) {
-        let now = Date()
-        let elapsed = now.timeIntervalSince(lastProgressTime)
-        guard elapsed > 1.0 else { return } // 至少间隔 1 秒
-
-        let delta = currentSizeMB - lastFileSize
-        if delta > 0 && elapsed > 0 {
-            let speed = delta / elapsed
-            if speed >= 10 {
-                downloadSpeed = String(format: "%.0f MB/s", speed)
-            } else if speed >= 0.1 {
-                downloadSpeed = String(format: "%.1f MB/s", speed)
-            } else {
-                downloadSpeed = String(format: "%.0f KB/s", speed * 1024)
-            }
-        } else {
-            downloadSpeed = ""
-        }
-        lastFileSize = currentSizeMB
-        lastProgressTime = now
-    }
-
-    // MARK: - 下载操作
-
-    /// 添加并开始下载单个 URL
-    func downloadURL(_ url: String) {
-        guard !url.isEmpty, !isDownloading else { return }
-
-        let task = DownloadTask(url: url, status: .pending)
-        tasks.insert(task, at: 0)         // 🔝 新任务插入到列表最前面
-        activeTaskIndex = 0
-        isDownloading = true
-        statusMessage = "正在提交..."
-
-        Task {
-            do {
-                let _ = try await api.startDownload(url: url)
-                statusMessage = "下载中..."
-                startProgressListening()
-            } catch {
-                handleError(error, forTaskAt: 0)
-            }
-        }
-    }
-
-    /// 添加并开始批量下载
     func downloadURLs(_ urls: [String]) {
-        guard !urls.isEmpty, !isDownloading else { return }
+        let valid = urls.filter { $0.hasPrefix("http://") || $0.hasPrefix("https://") }
+        guard !valid.isEmpty else { return }
 
-        let newTasks = urls.map { DownloadTask(url: $0, status: .pending) }
-        tasks.insert(contentsOf: newTasks, at: 0)  // 🔝 新任务插入到前面
-        activeTaskIndex = 0
-        isDownloading = true
-        statusMessage = "正在提交 \(urls.count) 个任务..."
-
-        Task {
-            do {
-                let _ = try await api.startBatchDownload(urls: urls)
-                statusMessage = "批量下载中..."
-                startProgressListening()
-            } catch {
-                handleError(error, forTaskAt: 0)
-            }
+        let available = maxQueue - tasks.count
+        guard available > 0 else {
+            statusMessage = "⚠️ 队列已满（最多 \(maxQueue) 个）"
+            return
         }
+
+        let newTasks = valid.prefix(available).map { DownloadTask(url: $0, status: .queued) }
+        tasks.append(contentsOf: newTasks)
+        statusMessage = "📋 已添加 \(newTasks.count) 个任务"
+
+        if !isDownloading { startNext() }
     }
 
-    // MARK: - SSE 进度监听
+    func downloadURL(_ url: String) { downloadURLs([url]) }
 
-    private func startProgressListening() {
+    // MARK: - 任务调度
+
+    private func startNext() {
+        guard let idx = tasks.firstIndex(where: { $0.status == .queued }) else {
+            if tasks.allSatisfy({ $0.status == .completed || $0.status == .failed }) {
+                finishAll()
+            }
+            return
+        }
+
+        isDownloading = true
+        tasks[idx].status = .downloading
+        objectWillChange.send()
+
+        // 启动 SSE 监听
         api.stopListening()
         api.listenProgress { [weak self] event in
-            Task { @MainActor in await self?.handleSSEEvent(event) }
+            Task { @MainActor in self?.handleSSEEvent(event) }
+        }
+
+        let url = tasks[idx].url
+        Task {
+            do {
+                statusMessage = "🚀 开始下载..."
+                let _ = try await api.startDownload(url: url, maxVideos: 1, timeout: 60)
+            } catch {
+                logger.error("提交失败: \(error.localizedDescription)")
+                tasks[idx].status = .failed
+                statusMessage = "❌ 提交失败: \(error.localizedDescription.prefix(40))"
+                onTaskFailed(at: idx)
+            }
         }
     }
 
-    private func handleSSEEvent(_ event: SSEEvent) async {
-        // 根据 url_index 更新对应任务的进度
-        let idx = event.urlIndex ?? activeTaskIndex ?? 0
-        if idx < tasks.count {
-            tasks[idx].applySSEEvent(event)
-        }
+    // MARK: - SSE 事件处理
 
-        // 处理批量事件
+    private func handleSSEEvent(_ event: SSEEvent) {
+        guard !tasks.isEmpty else { return }
+        let activeIdx = tasks.firstIndex(where: { $0.status == .downloading }) ?? 0
+
+        objectWillChange.send()
+        tasks[activeIdx].applySSEEvent(event)
+
         switch event.type {
-        case "batch_start":
-            statusMessage = "开始下载 (\(event.total ?? 0) 个URL)"
-        case "url_start":
-            if let url = event.url, let idx = event.urlIndex, idx < tasks.count {
-                tasks[idx].url = url
-                tasks[idx].status = .downloading
-            }
-        case "url_complete":
-            if let idx = event.urlIndex, idx < tasks.count {
-                tasks[idx].status = .completed
-                tasks[idx].progress = 100
-            }
-        case "url_error":
-            if let idx = event.urlIndex, idx < tasks.count {
-                tasks[idx].status = .failed
-            }
-        case "ffmpeg_progress":
-            if let idx = event.urlIndex, idx < tasks.count {
-                tasks[idx].status = .downloading
-                tasks[idx].progress = Double(event.percent ?? 0)
-            }
         case "batch_complete", "complete":
-            await onDownloadComplete()
-        case "convert_complete":
-            statusMessage = "转换完成"
+            onActiveComplete()
+            return  // ← 任务已移除，不能继续访问 tasks[activeIdx]
+        case "url_error":
+            tasks[activeIdx].status = .failed
+            onTaskFailed(at: activeIdx)
+            return  // ← 任务已移除
         default:
             break
         }
 
-        // 计算总进度
-        if !tasks.isEmpty {
-            totalProgress = tasks.reduce(0) { $0 + $1.progress } / Double(tasks.count)
-        }
-    }
+        // 以下代码仅在任务未完成时执行
+        totalProgress = tasks[activeIdx].progress
 
-    /// 下载全部完成后刷新历史
-    private func onDownloadComplete() async {
-        isDownloading = false
-        activeTaskIndex = nil
-        statusMessage = "✅ 下载完成"
-        api.stopListening()
-
-        // 🔔 发送系统通知
-        let done = tasks.filter { $0.status == .completed }
-        let failed = tasks.filter { $0.status == .failed }
-
-        if done.count == 1, let task = done.first {
-            // 单文件完成通知
-            let sizeStr = task.fileSizeMB > 0 ? String(format: "%.1f MB", task.fileSizeMB) : ""
-            notificationManager?.sendDownloadComplete(
-                filename: task.filename, fileSize: sizeStr, url: task.url
-            )
-            onDownloadComplete?(task.filename, sizeStr, task.url)
-        } else if done.count > 1 {
-            // 批量完成通知
-            notificationManager?.sendBatchComplete(total: done.count + failed.count, downloaded: done.count)
-        } else if !failed.isEmpty {
-            // 失败通知
-            if let task = failed.first {
-                notificationManager?.sendDownloadFailed(url: task.url, error: "下载失败")
+        if event.type == "ffmpeg_progress" {
+            if tasks[activeIdx].fileSizeMB > 0 {
+                updateSpeed(currentSizeMB: tasks[activeIdx].fileSizeMB)
             }
         }
-
-        // 移动已完成的任务到历史列表
-        completedTasks.insert(contentsOf: done, at: 0)
-        tasks.removeAll { $0.status == .completed }
-        if failed.isEmpty { tasks.removeAll() }
-
-        // 从后端刷新历史
-        if let history = try? await api.fetchHistory() {
-            completedTasks = history
-        }
     }
 
-    // MARK: - 错误处理
+    private func onActiveComplete() {
+        // url_complete 已先将状态设为 .completed，所以这里匹配两种状态
+        guard let idx = tasks.firstIndex(where: { $0.status == .downloading || $0.status == .completed }) else { return }
+        tasks[idx].status = .completed
+        tasks[idx].progress = 100
 
-    private func handleError(_ error: Error, forTaskAt index: Int) {
-        statusMessage = "❌ \(error.localizedDescription)"
+        let task = tasks[idx]
+        completedTasks.insert(task, at: 0)
+        tasks.remove(at: idx)
+
+        // 通知
+        let sizeStr = task.fileSizeMB > 0 ? String(format: "%.1f MB", task.fileSizeMB) : ""
+        notificationManager?.sendDownloadComplete(filename: task.filename, fileSize: sizeStr, url: task.url)
+
+        statusMessage = "✅ 下载完成"
+        // 继续下一个
+        startNext()
+    }
+
+    private func onTaskFailed(at idx: Int) {
+        completedTasks.insert(tasks[idx], at: 0)
+        tasks.remove(at: idx)
+        startNext()
+    }
+
+    private func finishAll() {
         isDownloading = false
-        if index < tasks.count {
-            tasks[index].status = .failed
+        downloadSpeed = ""
+        statusMessage = "🎉 全部完成"
+        api.stopListening()
+        // 刷新历史
+        Task {
+            if let history = try? await api.fetchHistory() { completedTasks = history }
         }
     }
 
-    // MARK: - 辅助操作
+    // MARK: - 速度计算
 
-    /// 移除任务
+    private var lastSize: Double = 0
+    private var lastTime = Date()
+    private func updateSpeed(currentSizeMB: Double) {
+        let now = Date()
+        let elapsed = now.timeIntervalSince(lastTime)
+        guard elapsed > 1.0 else { return }
+        let delta = currentSizeMB - lastSize
+        if delta > 0 {
+            let speed = delta / elapsed
+            downloadSpeed = speed >= 10 ? String(format: "%.0f MB/s", speed)
+                : speed >= 0.1 ? String(format: "%.1f MB/s", speed)
+                : String(format: "%.0f KB/s", speed * 1024)
+        }
+        lastSize = currentSizeMB
+        lastTime = now
+    }
+
+    // MARK: - 辅助
+
     func removeTask(_ task: DownloadTask) {
         tasks.removeAll { $0.id == task.id }
         completedTasks.removeAll { $0.id == task.id }
     }
-
-    /// 清空已完成列表
     func clearCompleted() { completedTasks.removeAll() }
 
-    private func findRepoRoot() -> String? {
-        var url = URL(fileURLWithPath: #filePath)
-        while url.path != "/" {
-            url = url.deletingLastPathComponent()
-            if FileManager.default.fileExists(atPath: url.appendingPathComponent(".git").path) { return url.path }
-        }
-        return nil
-    }
-
-    /// 打开输出目录（使用设置中保存的路径，或默认路径）
     func openOutputDirectory() {
         let path = settings.outputDirectory ?? defaultOutputDir
         NSWorkspace.shared.open(URL(fileURLWithPath: path))
     }
 
     private var defaultOutputDir: String {
-        findRepoRoot().map { "\($0)/videos" } ?? NSHomeDirectory() + "/Downloads"
+        var url = URL(fileURLWithPath: #filePath)
+        while url.path != "/" {
+            url = url.deletingLastPathComponent()
+            if FileManager.default.fileExists(atPath: url.appendingPathComponent(".git").path) {
+                return "\(url.path)/videos"
+            }
+        }
+        return NSHomeDirectory() + "/Downloads"
     }
 }
 
-// MARK: - 应用设置（UserDefaults 持久化）
+// MARK: - 设置
 
-/// 用户偏好设置，自动持久化到 UserDefaults
 struct AppSettings: Codable {
-    var outputDirectory: String?          // 自定义输出目录
-    var clipboardMonitoring: Bool = true  // 剪贴板监听开关
-    var maxConcurrent: Int = 1            // 并发下载数
-    var autoOpenFolder: Bool = true       // 下载完成自动打开目录
-
+    var outputDirectory: String?
+    var clipboardMonitoring = true
+    var autoOpenFolder = true
     static let key = "com.downieclip.settings"
 
-    /// 从 UserDefaults 加载
     static func load() -> AppSettings {
         guard let data = UserDefaults.standard.data(forKey: key),
-              let settings = try? JSONDecoder().decode(AppSettings.self, from: data)
+              let s = try? JSONDecoder().decode(AppSettings.self, from: data)
         else { return AppSettings() }
-        return settings
+        return s
     }
-
-    /// 保存到 UserDefaults
     func save() {
-        if let data = try? JSONEncoder().encode(self) {
-            UserDefaults.standard.set(data, forKey: Self.key)
-        }
+        if let data = try? JSONEncoder().encode(self) { UserDefaults.standard.set(data, forKey: Self.key) }
     }
 }

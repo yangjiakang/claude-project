@@ -17,7 +17,8 @@ struct DownloadTask: Identifiable, Codable, Equatable {
     var createdAt: Date
 
     enum TaskStatus: String, Codable, Equatable {
-        case pending     // 排队中
+        case queued      // 排队等待
+        case pending     // 准备提交
         case downloading // 下载中
         case converting  // 转换中
         case completed   // 已完成
@@ -51,11 +52,13 @@ struct DownloadTask: Identifiable, Codable, Equatable {
         switch event.type {
         case "url_start":
             self.url = event.url ?? self.url
+            self.filename = event.filename ?? self.filename
             self.status = .downloading
         case "ffmpeg_progress":
             self.progress = Double(event.percent ?? 0)
             self.status = .downloading
         case "url_complete":
+            self.filename = event.filename ?? self.filename
             self.status = .completed
             self.progress = 100
         case "url_error":
@@ -81,12 +84,13 @@ struct SSEEvent: Decodable {
     let percent: Int?
     let message: String?
     let url: String?
+    let filename: String?  // 输出文件名（网页标题命名）
     let downloaded: Int?
     let total: Int?
     let outputDir: String?
 
     enum CodingKeys: String, CodingKey {
-        case type, message, url, downloaded, total, percent
+        case type, message, url, filename, downloaded, total, percent
         case urlIndex = "url_index"
         case outputDir = "output_dir"
     }
